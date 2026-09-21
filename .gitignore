@@ -1,0 +1,4 @@
+/gbp
+/dist/
+*.json
+!package.json
