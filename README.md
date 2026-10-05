@@ -27,11 +27,10 @@ One-time setup:
 1. Request API access for a Google Cloud project with the [Business Profile API access form](https://support.google.com/business/workflow/16726127). Until Google approves the project its quota is 0 and every call returns 429.
 2. In that project, enable the APIs `gbp` calls: My Business Account Management, My Business Business Information, Business Profile Performance, My Business Verifications, and Google My Business.
 3. Create an OAuth client of type **Desktop app** and download its JSON. If the consent screen is in Testing status, refresh tokens expire after 7 days. Publish the app, or make it Internal if the managing account is in your Workspace org.
-4. Log in. `gbp` prints a URL, you approve in the browser, and the credential lands on stdout:
+4. Log in. `gbp` prints a URL, you approve in the browser, and the credential is written to the path you give, mode 0600. The file is replaced only after a successful login, so a failed or abandoned login keeps the old credential. The login waits 5 minutes for the browser.
 
 ```bash
-gbp login client-secret.json > ~/.config/gbp/credentials.json
-chmod 600 ~/.config/gbp/credentials.json
+gbp login client-secret.json ~/.config/gbp/credentials.json
 ```
 
 Commands resolve that credential in order:

@@ -2,8 +2,8 @@
 //
 // Business Profile does not support service accounts, so authentication is a
 // user OAuth refresh token. Run `gbp login` once with a Google account that
-// owns or manages the profiles; it prints an authorized-user JSON credential
-// that every other command reads.
+// owns or manages the profiles; it writes an authorized-user JSON credential
+// file that every other command reads.
 //
 // Credentials are resolved in order:
 //  1. GBP_CREDENTIALS_JSON: inline authorized-user JSON (for CI secrets)
@@ -26,9 +26,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -76,7 +79,7 @@ var (
 const usageText = `gbp: Google Business Profile CLI
 
 Usage:
-  gbp login <client-secret.json>
+  gbp login <client-secret.json> <credentials.json>
   gbp accounts list [paging flags]
   gbp locations list <account> [--read-mask f1,f2] [--filter expr] [--order-by expr] [paging flags]
   gbp locations get <location> [--read-mask f1,f2]
@@ -113,7 +116,7 @@ Flags:
   --metrics      comma-separated daily metrics (default: all), e.g.
                  WEBSITE_CLICKS,CALL_CLICKS,BUSINESS_DIRECTION_REQUESTS
 
-Auth (authorized-user JSON, printed by "gbp login"):
+Auth (authorized-user JSON, written by "gbp login"):
   GBP_CREDENTIALS_JSON    inline JSON (for CI secrets), or
   GBP_CREDENTIALS         path to JSON file
 
@@ -125,7 +128,8 @@ func main() {
 		fmt.Fprint(os.Stderr, usageText)
 		os.Exit(2)
 	}
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	var err error
 	switch os.Args[1] {
 	case "login":
@@ -160,12 +164,15 @@ func main() {
 	}
 }
 
-// cmdLogin runs the OAuth loopback flow for a Desktop-app client and prints
-// the resulting authorized-user credential to stdout.
+// cmdLogin runs the OAuth loopback flow for a Desktop-app client and writes
+// the resulting authorized-user credential to the given path, mode 0600. The
+// file is replaced only after a successful login, so a failed or abandoned
+// login leaves an existing credential intact.
 func cmdLogin(ctx context.Context, args []string) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: gbp login <client-secret.json>")
+	if len(args) != 2 {
+		return fmt.Errorf("usage: gbp login <client-secret.json> <credentials.json>")
 	}
+	credPath := args[1]
 	data, err := os.ReadFile(args[0])
 	if err != nil {
 		return fmt.Errorf("reading client secret: %w", err)
@@ -174,6 +181,19 @@ func cmdLogin(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("parsing client secret (want a Desktop app OAuth client): %w", err)
 	}
+
+	// Create the temp file before the browser flow so an unwritable path
+	// fails now, not after the user has approved access.
+	dir := filepath.Dir(credPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("login: %w", err)
+	}
+	tmp, err := os.CreateTemp(dir, ".gbp-credentials-*")
+	if err != nil {
+		return fmt.Errorf("login: %w", err)
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -230,6 +250,8 @@ func cmdLogin(ctx context.Context, args []string) error {
 	var res result
 	select {
 	case res = <-done:
+	case <-ctx.Done():
+		return fmt.Errorf("login: %w", ctx.Err())
 	case <-time.After(5 * time.Minute):
 		return fmt.Errorf("login: timed out waiting for the browser callback")
 	}
@@ -252,7 +274,17 @@ func cmdLogin(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return emit(out)
+	if _, err := tmp.Write(append(out, '\n')); err != nil {
+		return fmt.Errorf("login: writing credential: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("login: writing credential: %w", err)
+	}
+	if err := os.Rename(tmp.Name(), credPath); err != nil {
+		return fmt.Errorf("login: writing credential: %w", err)
+	}
+	fmt.Fprintf(stderr, "gbp: wrote credential to %s\n", credPath)
+	return nil
 }
 
 // pageFlags registers --page-size and --page-token on fs and returns a
