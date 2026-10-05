@@ -360,7 +360,7 @@ func TestCredentialResolution(t *testing.T) {
 }
 
 // TestLogin plays the browser: it reads the auth URL from stderr, follows its
-// redirect_uri with a code, and checks the credential printed to stdout.
+// redirect_uri with a code, and checks the credential file login writes.
 func TestLogin(t *testing.T) {
 	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
@@ -377,10 +377,11 @@ func TestLogin(t *testing.T) {
 		`{"installed":{"client_id":"id","client_secret":"secret","auth_uri":"https://auth.invalid/auth","token_uri":%q,"redirect_uris":["http://localhost"]}}`,
 		tokenSrv.URL)), 0o600)
 
-	origStdout, origStderr := stdout, stderr
-	out := &bytes.Buffer{}
-	stdout = out
-	t.Cleanup(func() { stdout, stderr = origStdout, origStderr })
+	credDir := filepath.Join(t.TempDir(), "gbp")
+	credPath := filepath.Join(credDir, "credentials.json")
+
+	origStderr := stderr
+	t.Cleanup(func() { stderr = origStderr })
 
 	// startLogin runs cmdLogin and returns the auth URL it printed.
 	startLogin := func() (url.Values, chan error) {
@@ -388,7 +389,7 @@ func TestLogin(t *testing.T) {
 		pr, pw := io.Pipe()
 		stderr = pw
 		done := make(chan error, 1)
-		go func() { done <- cmdLogin(context.Background(), []string{secret}) }()
+		go func() { done <- cmdLogin(context.Background(), []string{secret, credPath}) }()
 		sc := bufio.NewScanner(pr)
 		for sc.Scan() {
 			if strings.HasPrefix(sc.Text(), "https://auth.invalid/auth") {
@@ -412,6 +413,12 @@ func TestLogin(t *testing.T) {
 		resp.Body.Close()
 	}
 
+	if err := os.MkdirAll(credDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(credPath, []byte("previous"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	q, done := startLogin()
 	if q.Get("scope") != scope || q.Get("access_type") != "offline" || q.Get("prompt") != "consent" {
 		t.Errorf("auth URL query = %v", q)
@@ -420,17 +427,32 @@ func TestLogin(t *testing.T) {
 	if err := <-done; err == nil || !strings.Contains(err.Error(), "state mismatch") {
 		t.Fatalf("forged state: err = %v, want state mismatch", err)
 	}
+	if b, _ := os.ReadFile(credPath); string(b) != "previous" {
+		t.Errorf("failed login changed the credential file: %q", b)
+	}
 
 	q, done = startLogin()
 	callback(q, q.Get("state"))
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
+	b, err := os.ReadFile(credPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var cred map[string]string
-	if err := json.Unmarshal(out.Bytes(), &cred); err != nil {
-		t.Fatalf("stdout = %q: %v", out.String(), err)
+	if err := json.Unmarshal(b, &cred); err != nil {
+		t.Fatalf("credential file = %q: %v", b, err)
 	}
 	if cred["type"] != "authorized_user" || cred["refresh_token"] != "the-refresh-token" || cred["client_id"] != "id" {
 		t.Errorf("credential = %v", cred)
+	}
+	if fi, err := os.Stat(credPath); err != nil {
+		t.Error(err)
+	} else if fi.Mode().Perm() != 0o600 {
+		t.Errorf("credential file mode = %v, want 0600", fi.Mode().Perm())
+	}
+	if entries, _ := os.ReadDir(credDir); len(entries) != 1 {
+		t.Errorf("credential dir has %d entries, want only credentials.json", len(entries))
 	}
 }
